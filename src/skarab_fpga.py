@@ -17,7 +17,7 @@ __author__ = 'tyronevb'
 __date__ = 'April 2016'
 
 LOGGER = logging.getLogger(__name__)
-
+logging.basicConfig()
 
 class SkarabSendPacketError(ValueError):
     pass
@@ -615,7 +615,7 @@ class SkarabFpga(CasperFpga):
             # and raise an exception			
             LOGGER.error("Checksum mismatch! Will not attempt to boot from "
                          "SDRAM. Try re-uploading bitstream")
-            raise ChecksumMismatch("Spartan Checksum != Calculated Checksum")
+            raise InvalidSkarabBitstream("Spartan Checksum != Calculated Checksum")
 
         LOGGER.info("Checksum match. Bitstream uploaded successfully.")
 
@@ -909,6 +909,10 @@ class SkarabFpga(CasperFpga):
         if response_type == 'ReadSpiPageResp':
             read_bytes = unpacked_data[5:269]
             unpacked_data[5:269] = [read_bytes]
+
+        if response_type == 'ReadFlashWordsResp':
+            read_bytes = unpacked_data[5:389]
+            unpacked_data[5:389] = [read_bytes]
 
         # return response from skarab
         return SkarabFpga.sd_dict[response_type](*unpacked_data)
@@ -1396,10 +1400,10 @@ class SkarabFpga(CasperFpga):
             LOGGER.error('Problem configuring SDRAM')
             return False
 
-	# Code added to implement the following:
-    # 3.8: READ_FLASH_WORDS
-    # - Request sReadFlashReq
-    # - Response sReadFlashResp
+    # Code added to implement the following:
+    #  3.8: READ_FLASH_WORDS
+    # - Request ReadFlashReq
+    # - Response ReadFlashResp
 
     def read_flash_words(self, flash_address, num_words=256):
         '''
@@ -1439,7 +1443,7 @@ class SkarabFpga(CasperFpga):
 
         if response is not None:
             # Then send back ReadWords[:NumWords]
-            return response.ReadWords[:num_words]
+            return response.read_words[:num_words]
         else:
             errmsg = "Bad response received from SKARAB"
             LOGGER.error(errmsg)
@@ -1570,7 +1574,7 @@ class SkarabFpga(CasperFpga):
 
         if response is not None:
             # We have some data back
-            if response.ProgramSuccess:
+            if response.program_success:
                 # Job done
                 return True
             else:
@@ -1653,7 +1657,7 @@ class SkarabFpga(CasperFpga):
                                     number_of_words=11, pad_words=1)
 
         if response is not None:
-            if response.EraseSuccess:
+            if response.erase_success:
                 return True
             else:
                 # Erase request was made, but unsuccessful

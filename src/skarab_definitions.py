@@ -796,7 +796,7 @@ class ProgramSpiPageReq(Command):
 class ProgramSpiPageResp(Command):
     def __init__(self, command_id, seq_num, address_high, address_low,
                  num_bytes, verify_bytes, program_spi_page_success, padding):
-		super(ProgramSpiPageResp, self).__init__()
+        super(ProgramSpiPageResp, self).__init__()
         self.header = CommandHeader(command_id, seq_num, False)
         self.address_high = address_high
         self.address_low = address_low
