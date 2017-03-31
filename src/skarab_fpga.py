@@ -6,6 +6,8 @@ import struct
 import time
 import os
 import zlib
+import hashlib
+
 import skarab_definitions as sd
 
 from casperfpga import CasperFpga
@@ -37,9 +39,12 @@ class ReadFailed(ValueError):
     pass
 
 
-class ProgrammingError(ValueError):
+class WriteFailed(ValueError):
     pass
 
+
+class ProgrammingError(ValueError):
+    pass
 
 class SkarabFpga(CasperFpga):
     # create dictionary of skarab_definitions module
@@ -527,10 +532,21 @@ class SkarabFpga(CasperFpga):
 
         image_size = len(image_to_program)
 
+        if file_extension == '.fpg':
+            # Calculate and compare MD5 sums here, before carrying on
+            self.get_system_information(filename)  # This will hopefully populate fpga.system_info
+            fpgfile_md5sum = self.system_info['md5_bitstream']  # system_info is a dictionary
+            bitstream_md5sum = hashlib.md5(image_to_program).hexdigest()
+
+            # Only compare md5sum's if the input file_type is .fpg
+            if bitstream_md5sum != fpgfile_md5sum:
+                # Problem
+                errmsg = "bitstream_md5sum != fpgfile_md5sum"
+                LOGGER.error(errmsg)
+                raise InvalidSkarabBitstream(errmsg)
+
         # split image into chunks of 4096 words
-        image_chunks = [
-            image_to_program[ctr:ctr+8192] for ctr in range(0, image_size, 8192)
-        ]
+        image_chunks = [image_to_program[ctr:ctr+8192] for ctr in range(0, image_size, 8192)]
 
         # counter for num packets sent
         sent_pkt_counter = 0
@@ -587,20 +603,19 @@ class SkarabFpga(CasperFpga):
 
         # calculate checksum
         checksum = self.calculate_checksum_using_bitstream(image_to_program)
-        LOGGER.debug("Calculated bitsteam checksum: %s" % checksum)
+        LOGGER.debug("Calculated bitstream checksum: %s" % checksum)
 
         # read spartan checksum
         spartan_checksum = self.get_spartan_checksum()
         LOGGER.debug("Spartan bitstream checksum: %s" % spartan_checksum)
 
-
         if spartan_checksum != checksum:
             # checksum mismatch, so we clear sdram
             self.clear_sdram()
-            # and raise an exception
+            # and raise an exception			
             LOGGER.error("Checksum mismatch! Will not attempt to boot from "
                          "SDRAM. Try re-uploading bitstream")
-            raise InvalidSkarabBitstream("Checksum mismatch")
+            raise ChecksumMismatch("Spartan Checksum != Calculated Checksum")
 
         LOGGER.info("Checksum match. Bitstream uploaded successfully.")
 
@@ -1380,6 +1395,347 @@ class SkarabFpga(CasperFpga):
         else:
             LOGGER.error('Problem configuring SDRAM')
             return False
+
+	# Code added to implement the following:
+    # 3.8: READ_FLASH_WORDS
+    # - Request sReadFlashReq
+    # - Response sReadFlashResp
+
+    def read_flash_words(self, flash_address, num_words=256):
+        '''
+        Used to read a block of up to 384 16-bit words from the NOR flash on the SKARAB motherboard.
+        :param flash_address: 32-bit Address in the NOR flash to read 
+        :param num_words: Number of 16-bit words to be read - Default value of 256 words
+        :return: Words read by the function call
+        '''
+
+        '''
+        ReadFlashWordsReq consists of the following:
+        - Command Type: skarab_definitions.READ_FLASH_WORDS = 0x0000F
+        - Sequence Number: self.sequenceNumber
+        - Upper 16 bits of NOR flash address
+        - Lower 16 bits of NOR flash address
+        - NumWords: Number of 16-bit words to be read
+        '''
+
+        if num_words > 384:
+            errmsg = "Failed to ReadFlashWords - Maximum of 384 16-bit words can be read from the NOR flash"
+            LOGGER.error(errmsg)
+            raise ReadFailed(errmsg)
+
+        address_high, address_low = self.data_split_and_pack(flash_address)
+
+        # Create instance of ReadFlashWordsRequest
+        request = sd.ReadFlashWordsReq(self.seq_num,
+                                       address_high, address_low, num_words)
+
+        # Make actual function call and (hopefully) return data
+        # - Number of Words to be expected in the Response: 1+1+(1+1)+1+384+(3-1) = 391
+        response = self.send_packet(payload=request.create_payload(),
+                                    response_type='ReadFlashWordsResp',
+                                    expect_response=True,
+                                    command_id=sd.READ_FLASH_WORDS,
+                                    number_of_words=391, pad_words=2)
+
+        if response is not None:
+            # Then send back ReadWords[:NumWords]
+            return response.ReadWords[:num_words]
+        else:
+            errmsg = "Bad response received from SKARAB"
+            LOGGER.error(errmsg)
+            raise InvalidResponse(errmsg)
+
+    def verify_words(self, bitstream):
+        '''
+        This method reads back the programmed words from the flash device and checks it
+        against the data in the input .bin file uploaded to the Flash Memory.
+        :param bitstream: The physical bitstream from the input file uploaded to program Flash Memory
+        :return: Boolean success/fail
+        '''
+
+        bitstream_chunks = [bitstream[i:i+512] for i in range(0, len(bitstream), 512)]   # Now we have 512-byte chunks
+
+        flash_address = sd.DEFAULT_START_ADDRESS
+
+        # But again, make sure SDRAM is in FLASH Mode
+        # - as per Line 1827, in prepare_sdram_for_programming
+        if not self.sdram_reconfigure(sd.FLASH_MODE, False, False, False, False,
+                                      False, False,
+                                      False, False, False, 0x0, 0x0):
+            errmsg = "Unable to put SDRAM into FLASH Mode"
+            LOGGER.error(errmsg)
+            raise ProgrammingError(errmsg)
+        # else: Continue
+
+        # Compare against the bitstream extracted (and converted) from the .bin file
+        # - This will only iterate as long as there are words in the bitstream
+        # - Which could (and should) be without padding to the 512-word boundary
+        chunk_counter = 0
+        for chunk in bitstream_chunks:
+            LOGGER.debug("Comparing image_chunk: %d", chunk_counter)
+
+            # Check for padding BEFORE we convert to integer words
+            if len(chunk) % 512 != 0:
+                LOGGER.debug("Padding chunk")
+                chunk += '\xff' * (512 - (len(chunk) % 512))
+            # else: Continue
+
+            # Convert the 512 (string) bytes to 256 (integer) words
+            chunk_int = [struct.unpack('!H', chunk[i:i+2])[0] for i in range(0, 512, 2)]
+
+            words_read = self.read_flash_words(flash_address, 256)   # Returns words as an Integer list
+
+            for index in range(256):
+                if words_read[index] != chunk_int[index]:
+                    # Problem
+                    errmsg = "Flash_Word mismatch at index %d in bitstream_chunk %d", index, chunk_counter
+                    LOGGER.error(errmsg)
+                    raise ReadFailed(errmsg)
+
+            flash_address += 256
+            chunk_counter += 1
+
+        return True     # Words have been verified successfully
+
+    # 3.9: PROGRAM_FLASH_WORDS
+    # - Request sProgramFlashWordsReq
+    # - Response sProgramFlashWordsResp
+
+    def program_flash_words(self, flash_address, total_num_words, num_words, do_buffered_prog, start_prog, finish_prog,
+                            write_words):
+        '''
+        This is the low-level function, as per the FUM, to write to the Virtex Flash.
+
+        :param flash_address: 32-bit flash address to program to
+        :param total_num_words: Total number of 16-bit words to program over one or more Ethernet packets
+        :param num_words: Number of words in this (specific) Ethernet packet to program
+        :param do_buffered_prog: 0/1 = Perform Buffered Programming
+        :param start_prog: 0/1 - First packet in flash programming, start programming operation in flash
+        :param finish_prog: 0/1 - Last packet in flash programming, complete programming operation in flash
+        :param write_words: Words to program, max = 256 Words
+        :return: Boolean - Success/Fail - 1/0
+        '''
+
+        # First thing to check:
+        if num_words > 256 or len(write_words) > 256:
+            errmsg = "Maximum of 256 words can be programmed to the Flash at once"
+            LOGGER.error(errmsg)
+            raise ProgrammingError(errmsg)
+        # else: Continue as per normal
+
+        '''
+        sProgramFlashWordsReq consists of the following:
+        - Command Type: skarab_definitions.PROGRAM_FLASH_WORDS = 0x0011
+        - Sequence Number: self.seq_num
+        - Upper 16 bits of flash_address to start programming to
+        - Lower 16 bits of flash_address to start programming to
+        - TotalNumWords: Total number of 16-bit words to program over one or more Ethernet packets
+        - NumWords: Number of words in this Ethernet packet to program
+        - doBufferedProgramming: 0/1 - Perform Buffered Programming
+        - StartProgram: 0/1 - First packet in flash programming, start programming operation in flash
+        - FinishProgram: 0/1 - Last packet in flash programming, complete programming operation in flash
+        - WriteWords[256] (WordsToWrite): Words to program, max = 256 words
+        '''
+
+        # Split 32-bit Flash Address into 16-bit high and low values
+        flash_address_high, flash_address_low = self.data_split_and_pack(flash_address)
+
+        # Create instance of ProgramFlashWordsRequest
+        request = sd.ProgramFlashWordsReq(self.seq_num, flash_address_high, flash_address_low,
+                                          total_num_words, num_words, do_buffered_prog,
+                                          start_prog, finish_prog, write_words)
+
+        '''
+        sProgramFlashWordsResp consists of the following:
+        - Command Type
+        - Sequence Number
+        - Upper 16 bits of Flash Address
+        - Lower 16 bits of Flash Address
+        - Total Number of Words being Programmed
+        - Number of Words being written/that were written in the request (at the moment)
+        - DoBufferedProgramming
+        - First Packet in Flash Programming
+        - Last Packet in Flash Programming
+        - ProgramSuccess: 0/1
+        - Padding: [2]
+
+        - Therefore Total Number of Words to be expected in the Response:
+          - 1+1+1+1+1+1+1+1+1+1+(2-1) = 11 16-bit words (?)
+        '''
+        response = self.send_packet(payload=request.createPayload(),
+                                    response_type='ProgramFlashWordsResp',
+                                    expect_response=True,
+                                    command_id=sd.PROGRAM_FLASH_WORDS,
+                                    number_of_words=11, pad_words=1)
+
+        if response is not None:
+            # We have some data back
+            if response.ProgramSuccess:
+                # Job done
+                return True
+            else:
+                # ProgramFlashWordsRequest was made, but unsuccessful
+                errmsg = "Failed to Program Flash Words"
+                LOGGER.error(errmsg)
+                raise ProgrammingError(errmsg)
+        else:
+            errmsg = "Bad response received from SKARAB"
+            LOGGER.error(errmsg)
+            raise InvalidResponse(errmsg)
+
+    def program_words(self, bitstream, flash_address=sd.DEFAULT_START_ADDRESS):
+        '''
+        Higher level function call to Program n-many words from an input .hex (eventually .bin) file
+        This method scrolls through the words in the bitstream, and packs them into 256+256 words
+        This method erases the required number of blocks in the flash
+        - Only the required number of flash blocks are erased
+        :param bitstream: The physical bitstream extracted from the input .hex (eventually .bin) file
+                - This would have been extracted earlier when analysing the file
+        :param flash_address: Address in Flash Memory from where to start programming
+        :return: Boolean Success/Fail - 1/0
+        '''
+
+        # As per upload_to_ram() except now we're programming in chunks of 512 words
+        size = len(bitstream)
+        # Split image into chunks of 512 words
+        image_chunks = [bitstream[i:i + 512] for i in range(0, size, 512)]
+
+        padding_word = 0xffff
+
+        # Needs to be calculated on each 512 word chunk
+        for chunk in image_chunks:
+            if len(chunk) % 512 != 0:
+                # Needs to be padded to a 512 word boundary (and NOT 4096!)
+                chunk += struct.pack('<H', padding_word)
+            # else: Continue
+
+            # Need to program 256 words at a time, more specifically
+            # - Program first half: If passed, continue; else: return
+            # - Program second half: If passed, continue; else: return
+            if not self.program_flash_words(flash_address, 512, 256, True, True, False, chunk[:256]):
+                # Did not successfully program the first 256 words
+                errmsg = "Failed to program first 256 words of 512 word image block"
+                LOGGER.error(errmsg)
+                raise ProgrammingError(errmsg)
+            elif not self.program_flash_words(flash_address + 256, 512, 256, True, False, True, chunk[256:]):
+                # Did not successfully program the first 256 words
+                errmsg = "Failed to program second 256 words of 512 word image block"
+                LOGGER.error(errmsg)
+                raise ProgrammingError(errmsg)
+
+            flash_address += 512    # Shift the address we are writing to by 512 places
+            # Loop back to the next image chunk, repeat the process
+
+        # Now done programming the input bitstream, need to return and move on to VerifyWords()
+        return True
+
+    # 3.10: ERASE_FLASH_WORDS:
+    # - Request sEraseFlashBlockReq
+    # - Response sEraseFlashBlockResp
+    def erase_flash_block(self, flash_address=sd.DEFAULT_START_ADDRESS):
+        '''
+        Used to erase a block in the NOR flash on the SKARAB motherboard
+        :param flash_address: 32-bit address in the NOR flash to erase
+        :return: EraseSuccess (0/1); Padding
+        '''
+
+        address_high, address_low = self.data_split_and_pack(flash_address)
+
+        # Create instance of EraseFlashBlockRequest
+        request = sd.EraseFlashBlockReq(self.seq_num, address_high, address_low)
+
+        # Make the actual function call and (hopefully) return data
+        # - Number of Words to be expected in the Response: 1+1+(1+1)+1+(7-1) = 11
+        response = self.send_packet(payload=request.createPayload(),
+                                    response_type='EraseFlashBlockResp',
+                                    expect_response=True,
+                                    command_id=sd.ERASE_FLASH_BLOCK,
+                                    number_of_words=11, pad_words=1)
+
+        if response is not None:
+            if response.EraseSuccess:
+                return True
+            else:
+                # Erase request was made, but unsuccessful
+                errmsg = "Failed to Erase Flash Block"
+                LOGGER.error(errmsg)
+                raise ProgrammingError(errmsg)
+        else:
+            errmsg = "Bad response received from SKARAB"
+            LOGGER.error(errmsg)
+            raise InvalidResponse(errmsg)
+
+    # This is the "Parent function" that invokes erase_flash_block
+    def erase_blocks(self, num_flash_blocks, flash_address=sd.DEFAULT_START_ADDRESS):
+        '''
+        Higher level function call to Erase n-many Flash Blocks in preparation for program_flash_words
+        This method erases the required number of blocks in the flash
+        - Only the required number of flash blocks are erased
+        :param num_flash_blocks: Number of Flash Memory Blocks to be erased, to make space for the new image
+        :param flash_address: Start address from where to begin erasing Flash Memory
+        :return:
+        '''
+
+        # First, need to SdramReconfigure into 'Flash Mode'
+        # - as per Line 1827, in prepare_for_sdram_for_programming
+        if not self.sdram_reconfigure(sd.FLASH_MODE, False, False, False, False,
+                                      False, False,
+                                      False, False, False, 0x0, 0x0):
+            errmsg = "Unable to put SDRAM into FLASH Mode"
+            LOGGER.error(errmsg)
+            raise ProgrammingError(errmsg)
+        # else: Continue
+
+        # Now, to do the actual erasing of Flash Memory Blocks
+        for i in range(num_flash_blocks):
+            if not self.erase_flash_block(flash_address):
+                # Problem Erasing the Flash Block
+                errmsg = "Failed to Erase Flash Memory Block: %d", flash_address
+                LOGGER.error(errmsg)
+                raise ProgrammingError(errmsg)
+            # else: All good
+            # Increment Flash Block to Erase
+            flash_address += int(sd.DEFAULT_BLOCK_SIZE)
+
+        return True
+
+    @staticmethod
+    # Only working with BPIx8 .bin files now
+    def analyse_file(filename):
+        '''
+        This method analyses the input .bin file to determine the number of words to program,
+        and the number of blocks to erase
+        :param filename: Input .bin to be written to the Virtex FPGA
+        :return: Tuple - num_words (in file), num_memory_blocks (required to hold this file)
+        '''
+
+        contents = open(filename, 'rb').read()      # File contents are in bytes
+
+        if len(contents) % 2 != 0:
+            # Problem
+            errmsg = "Invalid file size: Number of Words is not whole"
+            LOGGER.error(errmsg)
+            raise InvalidSkarabBitstream(errmsg)
+        # else: Continue
+        num_words = len(contents) / 2
+        num_memory_blocks = int(math.ceil(num_words / sd.DEFAULT_BLOCK_SIZE))
+
+        return num_words, num_memory_blocks
+
+    # This function will call all the relevant functions as per the order done in Roach3VirtexFlashReconfigApp.cpp
+    # - AnalyseFile()
+    # - EraseBlocks()
+    # - ProgramWords()
+    # - VerifyWords()
+    def virtex_flash_reconfig(self, filename, blind_reconfig=False):
+        '''
+        This is the entire function that makes the necessary calls to reconfigure the
+        :param filename: The actual .hex file that is to be written to the Virtex FPGA
+        :param blind_reconfig: Reconfigure the board and don't wait to Verify what has been written
+        :return: Success/Fail - 0/1
+        '''
+
+        raise NotImplementedError	
 
     def read_spi_page(self, spi_address, num_bytes):
         """
