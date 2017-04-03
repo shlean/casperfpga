@@ -914,6 +914,9 @@ class SkarabFpga(CasperFpga):
             read_bytes = unpacked_data[5:389]
             unpacked_data[5:389] = [read_bytes]
 
+        if response_type == 'EraseFlashBlockResp':
+            something = unpacked_data
+
         # return response from skarab
         return SkarabFpga.sd_dict[response_type](*unpacked_data)
 
@@ -1521,15 +1524,14 @@ class SkarabFpga(CasperFpga):
         '''
 
         # First thing to check:
-        if num_words > 256 or len(write_words) > 256:
+        if num_words > 256 or len(write_words) > 512:
             errmsg = "Maximum of 256 words can be programmed to the Flash at once"
             LOGGER.error(errmsg)
             raise ProgrammingError(errmsg)
         # else: Continue as per normal
 
         '''
-        sProgramFlashWordsReq consists of the following:
-        - Command Type: skarab_definitions.PROGRAM_FLASH_WORDS = 0x0011
+        ProgramFlashWordsReq consists of the following:        
         - Sequence Number: self.seq_num
         - Upper 16 bits of flash_address to start programming to
         - Lower 16 bits of flash_address to start programming to
@@ -1550,7 +1552,7 @@ class SkarabFpga(CasperFpga):
                                           start_prog, finish_prog, write_words)
 
         '''
-        sProgramFlashWordsResp consists of the following:
+        ProgramFlashWordsResp consists of the following:
         - Command Type
         - Sequence Number
         - Upper 16 bits of Flash Address
@@ -1566,7 +1568,7 @@ class SkarabFpga(CasperFpga):
         - Therefore Total Number of Words to be expected in the Response:
           - 1+1+1+1+1+1+1+1+1+1+(2-1) = 11 16-bit words (?)
         '''
-        response = self.send_packet(payload=request.createPayload(),
+        response = self.send_packet(payload=request.create_payload(),
                                     response_type='ProgramFlashWordsResp',
                                     expect_response=True,
                                     command_id=sd.PROGRAM_FLASH_WORDS,
@@ -1602,26 +1604,27 @@ class SkarabFpga(CasperFpga):
         # As per upload_to_ram() except now we're programming in chunks of 512 words
         size = len(bitstream)
         # Split image into chunks of 512 words
-        image_chunks = [bitstream[i:i + 512] for i in range(0, size, 512)]
+        image_chunks = [bitstream[i:i + 1024] for i in range(0, size, 1024)]
 
-        padding_word = 0xffff
+        # padding_word = 0xffff
+        padding_byte = '\xff'
 
         # Needs to be calculated on each 512 word chunk
         for chunk in image_chunks:
-            if len(chunk) % 512 != 0:
+            if len(chunk) % 1024 != 0:
                 # Needs to be padded to a 512 word boundary (and NOT 4096!)
-                chunk += struct.pack('<H', padding_word)
+                chunk += (1024 - (len(chunk) % 1024)) * padding_byte
             # else: Continue
 
             # Need to program 256 words at a time, more specifically
             # - Program first half: If passed, continue; else: return
             # - Program second half: If passed, continue; else: return
-            if not self.program_flash_words(flash_address, 512, 256, True, True, False, chunk[:256]):
+            if not self.program_flash_words(flash_address, 512, 256, True, True, False, chunk[:512]):
                 # Did not successfully program the first 256 words
                 errmsg = "Failed to program first 256 words of 512 word image block"
                 LOGGER.error(errmsg)
                 raise ProgrammingError(errmsg)
-            elif not self.program_flash_words(flash_address + 256, 512, 256, True, False, True, chunk[256:]):
+            elif not self.program_flash_words(flash_address + 256, 512, 256, True, False, True, chunk[512:]):
                 # Did not successfully program the first 256 words
                 errmsg = "Failed to program second 256 words of 512 word image block"
                 LOGGER.error(errmsg)
@@ -1650,11 +1653,11 @@ class SkarabFpga(CasperFpga):
 
         # Make the actual function call and (hopefully) return data
         # - Number of Words to be expected in the Response: 1+1+(1+1)+1+(7-1) = 11
-        response = self.send_packet(payload=request.createPayload(),
+        response = self.send_packet(payload=request.create_payload(),
                                     response_type='EraseFlashBlockResp',
                                     expect_response=True,
                                     command_id=sd.ERASE_FLASH_BLOCK,
-                                    number_of_words=11, pad_words=1)
+                                    number_of_words=11, pad_words=6)
 
         if response is not None:
             if response.erase_success:
@@ -1703,9 +1706,9 @@ class SkarabFpga(CasperFpga):
 
         return True
 
-    @staticmethod
+    #@staticmethod
     # Only working with BPIx8 .bin files now
-    def analyse_file(filename):
+    def analyse_file(self, filename):
         '''
         This method analyses the input .bin file to determine the number of words to program,
         and the number of blocks to erase
@@ -1739,7 +1742,25 @@ class SkarabFpga(CasperFpga):
         :return: Success/Fail - 0/1
         '''
 
-        raise NotImplementedError	
+        num_words, num_memory_blocks = self.analyse_file(filename)
+
+        if (num_words == 0) or (num_memory_blocks == 0):
+            # Problem
+            errmsg = "Failed to Analyse File successfully"
+            LOGGER.error(errmsg)
+            raise InvalidSkarabBitstream(errmsg)
+        # else: Continue
+
+        if not self.erase_blocks(num_memory_blocks):
+            # Problem
+            errmsg = "Failed to Erase Flash Memory Blocks"
+            LOGGER.error(errmsg)
+            raise ProgrammingError(errmsg)
+        # else: Continue
+
+        # Not doing anything else yet
+
+        return True
 
     def read_spi_page(self, spi_address, num_bytes):
         """
