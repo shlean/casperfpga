@@ -1411,7 +1411,7 @@ class SkarabFpga(CasperFpga):
     def read_flash_words(self, flash_address, num_words=256):
         '''
         Used to read a block of up to 384 16-bit words from the NOR flash on the SKARAB motherboard.
-        :param flash_address: 32-bit Address in the NOR flash to read 
+        :param flash_address: 32-bit Address in the NOR flash to read
         :param num_words: Number of 16-bit words to be read - Default value of 256 words
         :return: Words read by the function call
         '''
@@ -1452,17 +1452,18 @@ class SkarabFpga(CasperFpga):
             LOGGER.error(errmsg)
             raise InvalidResponse(errmsg)
 
-    def verify_words(self, bitstream):
+    def verify_words(self, filename, flash_address=sd.DEFAULT_START_ADDRESS):
         '''
         This method reads back the programmed words from the flash device and checks it
         against the data in the input .bin file uploaded to the Flash Memory.
-        :param bitstream: The physical bitstream from the input file uploaded to program Flash Memory
+        :param filename: Of the input .bin file that was programmed to Flash Memory
+        :param flash_address: 32-bit Address in the NOR flash to START reading from
         :return: Boolean success/fail
         '''
 
+        bitstream = open(filename, 'rb').read()
         bitstream_chunks = [bitstream[i:i+512] for i in range(0, len(bitstream), 512)]   # Now we have 512-byte chunks
-
-        flash_address = sd.DEFAULT_START_ADDRESS
+        # Using 512-byte chunks = 256-word chunks because we are reading 256 words at a time from the Flash Memory
 
         # But again, make sure SDRAM is in FLASH Mode
         # - as per Line 1827, in prepare_sdram_for_programming
@@ -1589,21 +1590,21 @@ class SkarabFpga(CasperFpga):
             LOGGER.error(errmsg)
             raise InvalidResponse(errmsg)
 
-    def program_words(self, bitstream, flash_address=sd.DEFAULT_START_ADDRESS):
+    def program_words(self, filename, flash_address=sd.DEFAULT_START_ADDRESS):
         '''
         Higher level function call to Program n-many words from an input .hex (eventually .bin) file
         This method scrolls through the words in the bitstream, and packs them into 256+256 words
         This method erases the required number of blocks in the flash
         - Only the required number of flash blocks are erased
-        :param bitstream: The physical bitstream extracted from the input .hex (eventually .bin) file
-                - This would have been extracted earlier when analysing the file
+        :param filename: Of the input .bin file to write to Flash Memory
         :param flash_address: Address in Flash Memory from where to start programming
         :return: Boolean Success/Fail - 1/0
         '''
 
+        bitstream = open(filename, 'rb').read()
         # As per upload_to_ram() except now we're programming in chunks of 512 words
         size = len(bitstream)
-        # Split image into chunks of 512 words
+        # Split image into chunks of 512 words = 1024 bytes
         image_chunks = [bitstream[i:i + 1024] for i in range(0, size, 1024)]
 
         # padding_word = 0xffff
@@ -1706,9 +1707,9 @@ class SkarabFpga(CasperFpga):
 
         return True
 
-    #@staticmethod
+    @staticmethod
     # Only working with BPIx8 .bin files now
-    def analyse_file(self, filename):
+    def analyse_file(filename):
         '''
         This method analyses the input .bin file to determine the number of words to program,
         and the number of blocks to erase
@@ -1734,14 +1735,31 @@ class SkarabFpga(CasperFpga):
     # - EraseBlocks()
     # - ProgramWords()
     # - VerifyWords()
-    def virtex_flash_reconfig(self, filename, blind_reconfig=False):
+    def virtex_flash_reconfig(self, filename, flash_address=sd.DEFAULT_START_ADDRESS, blind_reconfig=False):
         '''
         This is the entire function that makes the necessary calls to reconfigure the
         :param filename: The actual .hex file that is to be written to the Virtex FPGA
+        :param flash_address: 32-bit Address in the NOR flash to start programming from
         :param blind_reconfig: Reconfigure the board and don't wait to Verify what has been written
         :return: Success/Fail - 0/1
         '''
 
+        # For completeness, make sure the input file is of a .bin disposition
+        file_extension = os.path.splitext(filename)[1]
+
+        if file_extension != '.bin':
+            # Problem
+            errmsg = "Input file was not a .bin file"
+            LOGGER.error(errmsg)
+            raise InvalidSkarabBitstream(errmsg)
+        # else: Continue
+
+        if not self.check_bitstream(open(filename, 'rb').read()):
+            errmsg = "Incompatible .bin file detected. Cannot Program Flash Memory."
+            LOGGER.error(errmsg)
+            raise InvalidSkarabBitstream(errmsg)
+
+        LOGGER.debug("VIRTEX FLASH RECONFIG: Analysing Words")
         num_words, num_memory_blocks = self.analyse_file(filename)
 
         if (num_words == 0) or (num_memory_blocks == 0):
@@ -1751,14 +1769,30 @@ class SkarabFpga(CasperFpga):
             raise InvalidSkarabBitstream(errmsg)
         # else: Continue
 
-        if not self.erase_blocks(num_memory_blocks):
+        LOGGER.debug("VIRTEX FLASH RECONFIG: Erasing Flash Memory Blocks")
+        if not self.erase_blocks(num_memory_blocks, flash_address):
             # Problem
             errmsg = "Failed to Erase Flash Memory Blocks"
             LOGGER.error(errmsg)
             raise ProgrammingError(errmsg)
         # else: Continue
 
-        # Not doing anything else yet
+        LOGGER.debug("VIRTEX FLASH RECONFIG: Programming Words to Flash Memory")
+        if not self.program_words(filename, flash_address):
+            # Problem
+            errmsg = "Failed to Program Flash Memory Blocks"
+            LOGGER.error(errmsg)
+            raise ProgrammingError(errmsg)
+        # else: Continue
+
+        if not blind_reconfig:
+            LOGGER.debug("VIRTEX FLASH RECONFIG: Verifying words that were written to Flash Memory")
+            if not self.verify_words(filename):
+                # Problem
+                errmsg = "Failed to Program Flash Memory Blocks"
+                LOGGER.error(errmsg)
+                raise ProgrammingError(errmsg)
+            # else: Continue
 
         return True
 
