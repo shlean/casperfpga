@@ -533,15 +533,27 @@ class SkarabFpga(CasperFpga):
         image_size = len(image_to_program)
 
         if file_extension == '.fpg':
-            # Calculate and compare MD5 sums here, before carrying on
-            self.get_system_information(filename)  # This will hopefully populate fpga.system_info
-            fpgfile_md5sum = self.system_info['md5_bitstream']  # system_info is a dictionary
-            bitstream_md5sum = hashlib.md5(image_to_program).hexdigest()
 
-            # Only compare md5sum's if the input file_type is .fpg
-            if bitstream_md5sum != fpgfile_md5sum:
-                # Problem
-                errmsg = "bitstream_md5sum != fpgfile_md5sum"
+            # As per Wes, allowing for backwards compatibility
+            # - Check if the md5sums exist, i.e. only need to check if the md5_bitstream key exists
+            self.get_system_information(filename)  # This will hopefully populate fpga.system_info
+            meta_data_dict = self.system_info
+
+            if 'md5_bitstream' in meta_data_dict.keys():
+                # Calculate and compare MD5 sums here, before carrying on
+                fpgfile_md5sum = self.system_info['md5_bitstream']  # system_info is a dictionary
+                bitstream_md5sum = hashlib.md5(image_to_program).hexdigest()
+
+                # Only compare md5sum's if the input file_type is .fpg
+                if bitstream_md5sum != fpgfile_md5sum:
+                    # Problem
+                    errmsg = "bitstream_md5sum != fpgfile_md5sum"
+                    LOGGER.error(errmsg)
+                    raise InvalidSkarabBitstream(errmsg)
+            else:
+                # .fpg file was created using an older version of mlib_devel
+                errmsg = "An older version of mlib_devel generated " + filename + "." \
+                            " Please update to include the md5sum on the bitstream in the .fpg header."
                 LOGGER.error(errmsg)
                 raise InvalidSkarabBitstream(errmsg)
 
