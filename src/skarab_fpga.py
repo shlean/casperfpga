@@ -12,6 +12,7 @@ import skarab_definitions as sd
 
 from casperfpga import CasperFpga
 from utils import parse_fpg
+from utils import threaded_fpga_function    # Using for upgrading n-many skarab boards at once
 
 __author__ = 'tyronevb'
 __date__ = 'April 2016'
@@ -414,8 +415,6 @@ class SkarabFpga(CasperFpga):
         The SKARAB boots from flash on start up.
         :return:
         """
-
-        # trigger a reboot to boot from flash
         self.reboot_fpga()
 
     def boot_from_sdram(self):
@@ -472,55 +471,31 @@ class SkarabFpga(CasperFpga):
 
         # check file extension to see what we're dealing with
         if file_extension == '.fpg':
-            # get bin file from fpg file
-            LOGGER.info('Extracting bitstream from fpg file.')
+            LOGGER.info('.fpg detected. Extracting .bin.')
             image_to_program = self.extract_bitstream(filename)
-            if not self.check_bitstream(image_to_program):
-                errmsg = 'Incompatible fpg file. Cannot program SKARAB.'
-                LOGGER.error(errmsg)
-                raise InvalidSkarabBitstream(errmsg)
-            else:
-                LOGGER.info('Valid bitstream detected')
         elif file_extension == '.hex':
-            LOGGER.warning(
-                'Hex file detected. Attempting to convert to '
-                'required bin file.')
+            LOGGER.info('.hex detected. Converting to .bin.')
             image_to_program = self.convert_hex_to_bin(filename)
-            if not self.check_bitstream(image_to_program):
-                errmsg = 'Incompatible hex file. Cannot program SKARAB.'
-                LOGGER.error(errmsg)
-                raise InvalidSkarabBitstream(errmsg)
-            else:
-                LOGGER.info('Valid bitstream detected')
         elif file_extension == '.bit':
-            LOGGER.warning(
-                'Bit file detected. Attempting to convert to required '
-                'bin file.')
+            LOGGER.info('.bit file detected. Converting to .bin.')
             image_to_program = self.convert_bit_to_bin(filename)
-            if not self.check_bitstream(image_to_program):
-                errmsg = 'Incompatible bit file. Cannot program SKARAB.'
-                LOGGER.error(errmsg)
-                raise InvalidSkarabBitstream(errmsg)
-            else:
-                LOGGER.info('Valid bitstream detected')
         elif file_extension == '.bin':
+            LOGGER.info('Reading .bin file.')
             image_to_program = open(filename, 'rb').read()
             if not self.check_bitstream(image_to_program):
-                LOGGER.warning(
-                    'Incompatible bin file. Attemping to convert.')
+                LOGGER.info('Incompatible .bin file. Attemping to convert.')
                 image_to_program = self.reorder_bytes_in_bin_file(
                     image_to_program)
-                if not self.check_bitstream(image_to_program):
-                    errmsg = 'Incompatible bin file. Cannot program SKARAB.'
-                    LOGGER.error(errmsg)
-                    raise InvalidSkarabBitstream(errmsg)
-                else:
-                    LOGGER.info('Valid bitstream detected')
-            else:
-                LOGGER.info('Valid bitstream detected ')
         else:
-            raise TypeError('Invalid file type. '
-                            'Only use .fpg, .bit, .hex or .bin files')
+            raise TypeError('Invalid file type. Only use .fpg, .bit, '
+                            '.hex or .bin files')
+
+        # check the generated bitstream
+        if not self.check_bitstream(image_to_program):
+            errmsg = 'Incompatible image file. Cannot program SKARAB.'
+            LOGGER.error(errmsg)
+            raise InvalidSkarabBitstream(errmsg)
+        LOGGER.info('Valid bitstream detected.')
 
         # at this point the bitstream is in memory
 
@@ -594,7 +569,7 @@ class SkarabFpga(CasperFpga):
                 # print 'tick %i' % sent_pkt_counter
                 sent_pkt_counter += 1
             except Exception as exc:
-                LOGGER.error('Uploading to SDRAM Failed')
+                LOGGER.error('Uploading to SDRAM failed.')
                 raise exc
 
         # if the bin file provided requires padding to 4096 word boundary
@@ -610,7 +585,7 @@ class SkarabFpga(CasperFpga):
                                    last_packet_in_image, image_chunk)
                 sent_pkt_counter += 1
             except Exception as exc:
-                LOGGER.error('Uploading to SDRAM Failed')
+                LOGGER.error('Uploading to SDRAM Failed.')
                 raise exc
 
         # calculate checksum
@@ -964,7 +939,8 @@ class SkarabFpga(CasperFpga):
         response received. else returns 'ok'
         """
         # TODO - refactor the requests/responses into one
-        # TODO - if the packet payloads are being formed here, we don't need to pass the sequence number to every Command. Rather the command that makes the payload should take the sequence number.
+        # TODO - if the packet payloads are being formed here, we don't need to pass the sequence number to every
+        #        Command. Rather the command that makes the payload should take the sequence number.
 
         # default to the control socket and port
         skarab_socket = skarab_socket or self.skarab_ctrl_sock
@@ -981,8 +957,11 @@ class SkarabFpga(CasperFpga):
                     return None
                 LOGGER.debug('Waiting for response.')
                 # wait for response until timeout
-                data_ready = select.select([skarab_socket], [], [],
-                                           sd.CONTROL_RESPONSE_TIMEOUT)
+                # data_ready = select.select([skarab_socket], [], [], sd.CONTROL_RESPONSE_TIMEOUT)
+
+                # For testing erase_flash_block
+                data_ready = select.select([skarab_socket], [], [], timeout)
+
                 # if we got a response, process it
                 if data_ready[0]:
                     data = skarab_socket.recvfrom(4096)
@@ -1656,7 +1635,7 @@ class SkarabFpga(CasperFpga):
         '''
         Used to erase a block in the NOR flash on the SKARAB motherboard
         :param flash_address: 32-bit address in the NOR flash to erase
-        :return: EraseSuccess (0/1); Padding
+        :return: erase_success - 0/1
         '''
 
         address_high, address_low = self.data_split_and_pack(flash_address)
@@ -1696,6 +1675,11 @@ class SkarabFpga(CasperFpga):
         :return:
         '''
 
+        default_value = True
+        if flash_address != sd.DEFAULT_START_ADDRESS:
+            default_value = False
+            start_address = flash_address
+
         # First, need to SdramReconfigure into 'Flash Mode'
         # - as per Line 1827, in prepare_for_sdram_for_programming
         if not self.sdram_reconfigure(sd.FLASH_MODE, False, False, False, False,
@@ -1707,15 +1691,26 @@ class SkarabFpga(CasperFpga):
         # else: Continue
 
         # Now, to do the actual erasing of Flash Memory Blocks
-        for i in range(num_flash_blocks):
+        infomsg = 'Erasing Flash Blocks from flash_address = {}'.format(flash_address)
+        LOGGER.info(infomsg)
+        block_counter = 0
+        while block_counter < num_flash_blocks:
+            # Erasing Flash Blocks this way because a request may timeout and result in an out-of-sequence response
             if not self.erase_flash_block(flash_address):
                 # Problem Erasing the Flash Block
-                errmsg = "Failed to Erase Flash Memory Block: %d", flash_address
+                errmsg = 'Failed to Erase Flash Memory Block at: 0x{:02X}. Retrying now...'.format(flash_address)
                 LOGGER.error(errmsg)
-                raise ProgrammingError(errmsg)
-            # else: All good
-            # Increment Flash Block to Erase
-            flash_address += int(sd.DEFAULT_BLOCK_SIZE)
+
+                # Reset the block_counter and flash_address to their initial values
+                block_counter = 0
+                if default_value:
+                    flash_address = sd.DEFAULT_START_ADDRESS
+                else:
+                    flash_address = start_address
+            else:
+                # All good
+                block_counter += 1
+                flash_address += int(sd.DEFAULT_BLOCK_SIZE)
 
         return True
 
@@ -2665,27 +2660,42 @@ class SkarabFpga(CasperFpga):
             return
 
     # AP
-    @staticmethod
-    def calculate_checksum_using_file(file_name):
+    def calculate_checksum_using_file(self, file_name):
         """
         Basically summing up all the words in the input file_name, and returning a 'Checksum'
         :param file_name: The actual filename, and not instance of the open file
-        :return: Tally of words in the (.bin) file
+        :return: Tally of words in the bitstream of the input file
         """
 
+        # Need to handle how the bitstream is defined
+        file_extension = os.path.splitext(file_name)[1]
+
+        if file_extension == '.fpg':
+            bitstream = self.extract_bitstream(file_name)
+        elif file_extension == '.bin':
+            bitstream = open(file_name, 'rb')
+        elif file_extension == '.hex':
+            bitstream = self.convert_hex_to_bin(file_name)
+        elif file_extension == '.bit':
+            bitstream = self.convert_bit_to_bin(file_name)
+        else:
+            # Problem
+            errmsg = "Unrecognised file extension"
+            raise InvalidSkarabBitstream(errmsg)
+
         flash_write_checksum = 0x00
-        file_size = os.path.getsize(file_name)
+        size = len(bitstream)
 
         # Need to scroll through file until there is nothing left to read
-        with open(file_name, 'rb') as f:
-            for i in range(file_size / 2):
-                two_bytes = f.read(2)
-                one_word = struct.unpack('H!', two_bytes)[0]
-                flash_write_checksum += one_word
+        for i in range(0, size, 2):
+            # This is just getting a substring, need to convert to hex
+            two_bytes = bitstream[i:i + 2]
+            one_word = struct.unpack('!H', two_bytes)[0]
+            flash_write_checksum += one_word
 
-        if (file_size % 8192) != 0:
+        if (size % 8192) != 0:
             # padding required
-            num_padding_bytes = 8192 - (file_size % 8192)
+            num_padding_bytes = 8192 - (size % 8192)
             for i in range(num_padding_bytes / 2):
                 flash_write_checksum += 0xffff
 
@@ -2731,11 +2741,8 @@ class SkarabFpga(CasperFpga):
         """
 
         upper_address, lower_address = (0x001ffe02, 0x001ffe03)
-
         upper_byte = self.read_spi_page(upper_address, 1)[0]
-
         lower_byte = self.read_spi_page(lower_address, 1)[0]
-
         spartan_flash_write_checksum = (upper_byte << 8) | lower_byte
 
         return spartan_flash_write_checksum
@@ -2747,6 +2754,7 @@ class SkarabFpga(CasperFpga):
         :return: String containing 'Major.Minor'
         """
 
+        # As per the TcpDump
         spi_address = 0x001ffe00
 
         # Just a heads-up, read_spi_page(address, num_bytes)
@@ -2757,5 +2765,64 @@ class SkarabFpga(CasperFpga):
         version_number = str(major) + '.' + str(minor)
 
         return version_number
+
+    def compare_md5_checksums(self, filename):
+        '''
+        Easier way to do comparisons against the MD5 Checksums in the .fpg file header. Two MD5 Checksums:
+        - md5_header: MD5 Checksum calculated on the .fpg-header
+        - md5_bitstream: MD% Checksum calculated on the actual bitstream, starting after '?quit'
+        :param filename: Of the input .fpg file to be anaylsed
+        :return: Boolean - True/False - 1/0 - Success/Fail
+        '''
+
+        # Before we kick off, make sure the input file is indeed an .fpg file
+        file_extension = os.path.splitext(filename)[1]
+
+        if file_extension != '.fpg':
+            # Input file was not an fpg file
+            errmsg = "Input file was not an fpg file"
+            LOGGER.error(errmsg)
+            raise InvalidSkarabBitstream(errmsg)
+
+        # Extract bitstream from the .fpg file
+        bitstream = self.extract_bitstream(filename)
+
+        # First, tokenize the meta-data in the .fpg-header
+        self.get_system_information(filename)
+        meta_data_dict = self.system_info
+
+        if 'md5_bitstream' in meta_data_dict.keys():
+            # Calculate and compare MD5 sums here, before carrying on
+            fpgfile_md5sum = self.system_info['md5_bitstream']  # system_info is a dictionary
+            bitstream_md5sum = hashlib.md5(filename).hexdigest()
+
+            # Only compare md5sum's if the input file_type is .fpg
+            if bitstream_md5sum != fpgfile_md5sum:
+                # Problem
+                errmsg = "bitstream_md5sum != fpgfile_md5sum"
+                LOGGER.error(errmsg)
+                raise InvalidSkarabBitstream(errmsg)
+        else:
+            # .fpg file was created using an older version of mlib_devel
+            errmsg = "An older version of mlib_devel generated " + filename + "." \
+                      " Please update to include the md5sum on the bitstream in the .fpg header."
+            LOGGER.error(errmsg)
+            raise InvalidSkarabBitstream(errmsg)
+
+        return None
+
+    def upload_to_skarab_boards(self, skarab_list, filename):
+        '''
+        
+        :param skarab_list: List of SKARAB Boards to upload 'filename' to
+        :param filename: Of the bitstream to be uploaded the SKARAB Boards
+        :return: boolean Success/Fail - 1/0
+        '''
+
+        function_name = 'upload_to_ram'
+
+        result = threaded_fpga_function()
+
+        return NotImplementedError
 
 # end
