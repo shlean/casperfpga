@@ -124,13 +124,5 @@ class Transport(object):
         """
         pass
 
-    def get_system_information_from_transport(self):
-        """
-        If implemented, this method allows a client
-        to get system information from a running board.
-        I.e., without having to supply an fpg file.
-        """
-        raise NotImplementedError
-
 
 # end
